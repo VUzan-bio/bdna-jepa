@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "bdna-jepa"
+version = "4.0.0"
+description = "Bacterial Joint-Embedding Predictive Architecture for genomic foundation modeling"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [{name = "Valentin Uzan", email = "uzanval@gmail.com"}]
+keywords = ["genomics", "self-supervised-learning", "jepa", "bacteria", "foundation-model"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.1",
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "wandb>=0.15",
+    "tokenizers>=0.15",
+    "huggingface-hub>=0.20",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4", "pytest-cov>=4.1", "ruff>=0.3", "mypy>=1.8", "pre-commit>=3.5"]
+eval = ["umap-learn>=0.5", "matplotlib>=3.8", "seaborn>=0.13"]
+all = ["bdna-jepa[dev,eval]"]
+
+[project.urls]
+Repository = "https://github.com/VUzan-bio/bdna-jepa"
+HuggingFace = "https://huggingface.co/orgava/dna-bacteria-jepa"
+
+[tool.setuptools.packages.find]
+include = ["bdna_jepa*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

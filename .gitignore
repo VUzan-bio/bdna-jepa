@@ -1,0 +1,33 @@
+# Data (regenerable)
+data/genomes/
+data/processed/
+data/tokenizer/
+
+# Outputs (generated)
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# W&B
+wandb/

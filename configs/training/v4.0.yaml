@@ -1,0 +1,58 @@
+# B-JEPA v4.0 training recipe
+# Target hardware: single A100 80GB
+version: v4.0
+
+# ── Optimization ──
+optimizer: adamw
+peak_lr: 1.0e-3
+min_lr: 1.0e-6
+warmup_epochs: 20
+weight_decay_start: 0.04
+weight_decay_end: 0.4
+beta1: 0.9
+beta2: 0.95
+eps: 1.0e-8
+grad_clip: 1.0
+lr_schedule: cosine
+
+# ── Training ──
+epochs: 300
+batch_size: 256
+num_workers: 4
+mixed_precision: true
+
+# ── Data ──
+data_path: data/processed/pretrain_sequences_expanded.csv
+
+# ── EMA ──
+ema_start: 0.996
+ema_end: 1.0
+ema_schedule: cosine
+
+# ── Masking ──
+mlm_mask_ratio: 0.15
+
+# ── Loss (GradNorm adapts these) ──
+loss_weight_mlm: 1.0
+loss_weight_jepa: 1.0
+loss_weight_vicreg_var: 25.0
+loss_weight_vicreg_cov: 1.0
+vicreg_gamma: 1.0
+use_gradnorm: true
+gradnorm_alpha: 1.5
+
+# ── Fragment JEPA ──
+use_fragment_jepa: true
+fragment_context_size: 4
+
+# ── Checkpointing ──
+checkpoint_dir: outputs/checkpoints/v4.0
+save_every: 10
+eval_every: 10
+
+# ── Logging ──
+use_wandb: true
+wandb_project: bdna-jepa
+log_every: 50
+
+seed: 42
