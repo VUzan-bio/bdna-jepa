@@ -98,44 +98,50 @@ plt.rcParams.update({
 # ══════════════════════════════════════════════════════════════════════════
 
 def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_path: str, device: str):
-    """Load B-JEPA model from checkpoint. Adjust imports to match your codebase."""
-    import yaml
+    """Load BJEPA model from checkpoint using BJEPAConfig."""
+    from bdna_jepa.config import BJEPAConfig
+    from bdna_jepa.models.jepa import BJEPA
+    from bdna_jepa.data.tokenizer import CharTokenizer
 
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
+    # Load config from YAML
+    try:
+        config = BJEPAConfig.from_yaml(config_path)
+    except AttributeError:
+        # Fallback: load yaml manually and construct config
+        import yaml
+        with open(config_path) as f:
+            raw = yaml.safe_load(f)
+        config = BJEPAConfig(**raw) if isinstance(raw, dict) else BJEPAConfig()
 
-    # ── Import your modules (adjust paths as needed) ──
-    from bdna_jepa.model.encoder import BacterialDNAEncoder
-    from bdna_jepa.data.tokenizer import BPETokenizer
-    from bdna_jepa.data.dataset import PretrainDataset
-
-    tokenizer = BPETokenizer.from_file(tokenizer_path)
-
-    # Build encoder from config
-    model_cfg = config.get("model", config)
-    encoder = BacterialDNAEncoder(
-        vocab_size=model_cfg.get("vocab_size", 4096),
-        d_model=model_cfg.get("d_model", 576),
-        n_layers=model_cfg.get("n_layers", 12),
-        n_heads=model_cfg.get("n_heads", 9),
-        max_seq_len=model_cfg.get("max_seq_len", 512),
-    )
+    # Build full BJEPA model (has context_encoder + mlm_head)
+    model = BJEPA(config)
 
     # Load checkpoint
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    state_dict = ckpt.get("context_encoder", ckpt.get("encoder", ckpt.get("model_state_dict", ckpt)))
+    state_dict = ckpt.get("model_state_dict", ckpt)
 
     # Strip "module." prefix if present (DDP)
     cleaned = {}
     for k, v in state_dict.items():
         cleaned[k.replace("module.", "")] = v
-    encoder.load_state_dict(cleaned, strict=False)
-    encoder.to(device).eval()
+    model.load_state_dict(cleaned, strict=False)
+    model.to(device).eval()
 
-    print(f"Loaded checkpoint: epoch {ckpt.get('epoch', '?')}, loss {ckpt.get('loss', '?'):.4f}")
-    print(f"Model params: {sum(p.numel() for p in encoder.parameters()):,}")
+    epoch = ckpt.get("epoch", "?")
+    loss = ckpt.get("loss", 0.0)
+    print(f"Loaded checkpoint: epoch {epoch}, loss {loss:.4f}")
+    print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    return encoder, tokenizer, config
+    # Load tokenizer — try BPE first, fall back to CharTokenizer
+    try:
+        from bdna_jepa.data.tokenizer import BPETokenizer
+        tokenizer = BPETokenizer.from_file(tokenizer_path)
+        print(f"Tokenizer: BPE from {tokenizer_path}")
+    except (ImportError, AttributeError):
+        tokenizer = CharTokenizer()
+        print("Tokenizer: CharTokenizer (fallback)")
+
+    return model, tokenizer, config
 
 
 def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int):
@@ -168,28 +174,37 @@ def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int
 # ══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def extract_embeddings(encoder, dataloader, device, max_batches=None):
-    """Extract CLS embeddings and token-level embeddings from the encoder."""
+def extract_embeddings(model, dataloader, device, max_batches=None):
+    """Extract CLS embeddings from the BJEPA model's context encoder."""
     cls_embeddings = []
     all_input_ids = []
     all_gc_contents = []
+
+    encoder = model.context_encoder
 
     for i, batch in enumerate(dataloader):
         if max_batches and i >= max_batches:
             break
 
         input_ids = batch["input_ids"].to(device)
-        out = encoder(input_ids, return_all_tokens=True)
+        out = encoder(input_ids)
 
-        # CLS embedding
-        cls_emb = out["cls"]  # (B, D)
+        # Handle different return types: dict or tensor
+        if isinstance(out, dict):
+            cls_emb = out.get("cls", out.get("cls_token"))
+            if cls_emb is None:
+                # Fallback: first token of sequence output
+                tokens = out.get("tokens", out.get("x"))
+                cls_emb = tokens[:, 0, :]
+        elif isinstance(out, torch.Tensor):
+            # (B, L+1, D) with CLS prepended — take first token
+            cls_emb = out[:, 0, :]
+        else:
+            raise ValueError(f"Unexpected encoder output type: {type(out)}")
+
         cls_embeddings.append(cls_emb.cpu())
-
-        # Track input_ids for MLM analysis
         all_input_ids.append(input_ids.cpu())
 
-        # Compute GC content from input tokens
-        # This is approximate — we look at the raw token IDs
         gc = compute_gc_from_ids(input_ids.cpu())
         all_gc_contents.append(gc)
 
@@ -232,27 +247,18 @@ def compute_gc_from_ids(input_ids: torch.Tensor) -> torch.Tensor:
 # ══════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
-def evaluate_mlm(encoder, dataloader, device, mask_ratio=0.15, n_batches=50):
+def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
     """
     Evaluate MLM accuracy by masking tokens and checking predictions.
-    Uses span masking similar to training.
     """
-    from bdna_jepa.data.masking import create_span_mask  # adjust import
+    from bdna_jepa.data.masking import random_mask
 
     correct = 0
     total = 0
-    per_position_correct = defaultdict(int)
-    per_position_total = defaultdict(int)
     loss_sum = 0.0
 
-    # Get the MLM head from the full model if available
-    # If encoder doesn't have mlm_head, we need the trainer's mlm_head
-    has_mlm_head = hasattr(encoder, 'mlm_head')
-
-    if not has_mlm_head:
-        print("  WARNING: Encoder has no mlm_head attribute.")
-        print("  Attempting to load from checkpoint...")
-        return None
+    encoder = model.context_encoder
+    mlm_head = model.mlm_head
 
     for i, batch in enumerate(dataloader):
         if i >= n_batches:
@@ -261,43 +267,56 @@ def evaluate_mlm(encoder, dataloader, device, mask_ratio=0.15, n_batches=50):
         input_ids = batch["input_ids"].to(device)
         B, L = input_ids.shape
 
-        # Create mask
-        mask = create_span_mask(B, L, mask_ratio=mask_ratio, device=device)
+        # Apply masking (returns masked_tokens, mask, labels)
+        masked_ids, mask, labels = random_mask(
+            input_ids, mask_ratio=mask_ratio, mask_id=1,
+            vocab_size=4096, special_token_max=5,
+        )
 
-        # Save original tokens at masked positions
-        original_ids = input_ids.clone()
+        # Forward through encoder
+        out = encoder(masked_ids)
 
-        # Replace masked positions with [MASK] token (typically id=4)
-        masked_ids = input_ids.clone()
-        masked_ids[mask] = 4  # MASK token ID
+        # Get token embeddings
+        if isinstance(out, dict):
+            token_embs = out.get("tokens", out.get("x"))
+            if token_embs is None:
+                # If encoder returns (B, L+1, D) with CLS, skip CLS
+                token_embs = list(out.values())[0]
+        elif isinstance(out, torch.Tensor):
+            # (B, L+1, D) — skip CLS token at position 0
+            token_embs = out[:, 1:, :]  # (B, L, D)
+        else:
+            raise ValueError(f"Unexpected output type: {type(out)}")
 
-        # Forward pass
-        out = encoder(masked_ids, return_all_tokens=True)
-        token_embs = out["tokens"]  # (B, L, D)
+        # Ensure token_embs matches input length
+        if token_embs.shape[1] != L:
+            # CLS prepended — skip first token
+            token_embs = token_embs[:, 1:L+1, :]
 
         # MLM head prediction
-        logits = encoder.mlm_head(token_embs)  # (B, L, vocab_size)
+        logits = mlm_head(token_embs)  # (B, L, vocab_size)
 
-        # Only evaluate at masked positions
-        masked_logits = logits[mask]  # (N_masked, vocab_size)
-        masked_labels = original_ids[mask]  # (N_masked,)
+        # Only evaluate at masked positions (labels != -100)
+        valid = labels != -100
+        if valid.sum() == 0:
+            continue
+
+        masked_logits = logits[valid]  # (N_masked, vocab_size)
+        masked_labels = labels[valid]  # (N_masked,)
 
         preds = masked_logits.argmax(dim=-1)
         correct += (preds == masked_labels).sum().item()
         total += masked_labels.numel()
 
-        # Per-position tracking
-        mask_positions = mask.nonzero(as_tuple=True)
-        for pos in mask_positions[1].cpu().tolist():
-            per_position_total[pos] += 1
-            # We'd need finer tracking here; skip for now
-
-        # Loss
         loss = F.cross_entropy(masked_logits, masked_labels)
         loss_sum += loss.item()
 
-    accuracy = correct / total if total > 0 else 0.0
-    avg_loss = loss_sum / n_batches
+    if total == 0:
+        print("  WARNING: No masked tokens found")
+        return None
+
+    accuracy = correct / total
+    avg_loss = loss_sum / min(n_batches, i + 1)
 
     print(f"  MLM Accuracy: {accuracy:.4f} ({correct}/{total})")
     print(f"  MLM Loss: {avg_loss:.4f} (vs ln(810)={np.log(810):.4f} random baseline)")
@@ -355,9 +374,10 @@ def compute_embedding_health(embeddings: torch.Tensor):
     }
 
 
-def compute_dead_neurons(encoder, dataloader, device, n_batches=20):
+def compute_dead_neurons(model, dataloader, device, n_batches=20):
     """Check for dead neurons in SwiGLU layers."""
     activation_counts = {}
+    encoder = model.context_encoder
 
     def hook_fn(name):
         def fn(module, input, output):
@@ -367,7 +387,6 @@ def compute_dead_neurons(encoder, dataloader, device, n_batches=20):
                     "active": None,
                 }
             inp = input[0] if isinstance(input, tuple) else input
-            # After SiLU in SwiGLU, check which units are non-zero
             active = (inp.abs() > 1e-6).float().sum(dim=(0, 1))
             if activation_counts[name]["active"] is None:
                 activation_counts[name]["active"] = active.cpu()
@@ -376,7 +395,6 @@ def compute_dead_neurons(encoder, dataloader, device, n_batches=20):
             activation_counts[name]["total"] += inp.shape[0] * inp.shape[1]
         return fn
 
-    # Hook SwiGLU w2 layers
     hooks = []
     for name, module in encoder.named_modules():
         if "w2" in name and isinstance(module, torch.nn.Linear):
@@ -387,7 +405,7 @@ def compute_dead_neurons(encoder, dataloader, device, n_batches=20):
             if i >= n_batches:
                 break
             input_ids = batch["input_ids"].to(device)
-            encoder(input_ids, return_all_tokens=True)
+            encoder(input_ids)
 
     for h in hooks:
         h.remove()
@@ -810,11 +828,12 @@ def main():
 
     # ── Load model ──
     print("\n[1/7] Loading model...")
-    encoder, tokenizer, config = load_model_and_tokenizer(
+    model, tokenizer, config = load_model_and_tokenizer(
         args.checkpoint, args.config, args.tokenizer, device
     )
 
-    max_seq_len = config.get("model", config).get("max_seq_len", 512)
+    # BJEPAConfig is a dataclass — access encoder config
+    max_seq_len = getattr(config.encoder, "max_seq_len", 512) if hasattr(config, "encoder") else 512
 
     # ── Build dataloader ──
     print("\n[2/7] Building dataloader...")
@@ -822,7 +841,7 @@ def main():
 
     # ── Extract embeddings ──
     print("\n[3/7] Extracting embeddings...")
-    embeddings, input_ids, gc_contents = extract_embeddings(encoder, loader, device)
+    embeddings, input_ids, gc_contents = extract_embeddings(model, loader, device)
 
     # ── Compute metrics ──
     print("\n[4/7] Computing embedding health...")
@@ -835,12 +854,12 @@ def main():
 
     print("\n[4b/7] Computing dead neurons...")
     loader2 = build_dataloader(args.data, tokenizer, max_seq_len, 2000)
-    dead_fracs, dead_frac = compute_dead_neurons(encoder, loader2, device)
+    dead_fracs, dead_frac = compute_dead_neurons(model, loader2, device)
 
     # ── MLM accuracy ──
     print("\n[5/7] Evaluating MLM accuracy...")
     loader3 = build_dataloader(args.data, tokenizer, max_seq_len, 5000)
-    mlm_results = evaluate_mlm(encoder, loader3, device)
+    mlm_results = evaluate_mlm(model, loader3, device)
 
     # ── Generate figures ──
     print("\n[6/7] Generating figures...")
