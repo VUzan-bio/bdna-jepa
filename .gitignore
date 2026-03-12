@@ -31,3 +31,6 @@ venv/
 
 # W&B
 wandb/
+
+#claude
+.claude/
