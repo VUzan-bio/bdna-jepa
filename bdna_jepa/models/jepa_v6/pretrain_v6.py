@@ -1143,52 +1143,166 @@ def gc_correlation(tokens, embeddings, pad_id, gc_ids):
 
 
 # =============================================================================
-# 13. Visualization
+# 13. Visualization — Separate plots + wandb-native logging
 # =============================================================================
 
 @torch.no_grad()
-def generate_viz(emb_np, gc_np, save_path, epoch):
+def generate_viz(emb_np, gc_np, viz_dir, epoch, use_wandb=False, global_step=0):
+    """Generate UMAP + t-SNE as separate plots. Log natively to wandb.
+
+    Creates:
+      - umap_epoch{N}.png  — UMAP colored by GC content
+      - tsne_epoch{N}.png  — t-SNE colored by GC content
+      - svd_epoch{N}.png   — Singular value spectrum
+      - wandb: interactive scatter table (hover/filter)
+      - wandb: embedding norm histogram
+      - wandb: singular value line plot
+    """
     try:
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
-        import umap
-        from sklearn.manifold import TSNE
     except ImportError:
-        print("  Viz skipped — install umap-learn, sklearn, matplotlib")
-        return
+        print("  Viz skipped — install matplotlib")
+        return {}
 
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+    wandb_log = {}
 
+    # -- UMAP --
     try:
+        import umap
         reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.3,
                             metric='cosine', random_state=42)
-        coords = reducer.fit_transform(emb_np)
-        sc = axes[0].scatter(coords[:, 0], coords[:, 1], c=gc_np,
-                             cmap='RdYlBu_r', s=3, alpha=0.6)
-        plt.colorbar(sc, ax=axes[0], label='GC content')
-        axes[0].set_title(f'UMAP — Epoch {epoch} (GC%)')
-    except Exception as e:
-        axes[0].text(0.5, 0.5, f'Failed: {e}', transform=axes[0].transAxes, ha='center')
+        umap_coords = reducer.fit_transform(emb_np)
 
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sc = ax.scatter(umap_coords[:, 0], umap_coords[:, 1], c=gc_np,
+                        cmap='RdYlBu_r', s=3, alpha=0.6)
+        plt.colorbar(sc, ax=ax, label='GC content')
+        ax.set_title(f'UMAP — Epoch {epoch}')
+        ax.set_xlabel('UMAP-1')
+        ax.set_ylabel('UMAP-2')
+        plt.tight_layout()
+        umap_path = os.path.join(viz_dir, f"umap_epoch{epoch:03d}.png")
+        plt.savefig(umap_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: {umap_path}")
+
+        if use_wandb:
+            wandb_log["viz/umap"] = wandb.Image(umap_path, caption=f"UMAP Epoch {epoch}")
+
+            # Interactive scatter table — hover to see GC%, coords
+            n_table = min(2000, len(umap_coords))
+            table = wandb.Table(columns=["umap_1", "umap_2", "gc_content", "norm"])
+            norms = np.linalg.norm(emb_np[:n_table], axis=1)
+            for i in range(n_table):
+                table.add_data(
+                    float(umap_coords[i, 0]), float(umap_coords[i, 1]),
+                    float(gc_np[i]), float(norms[i]),
+                )
+            wandb_log["viz/umap_interactive"] = wandb.plot.scatter(
+                table, "umap_1", "umap_2", title=f"UMAP Epoch {epoch} (hover for GC%)"
+            )
+
+    except Exception as e:
+        print(f"  UMAP failed: {e}")
+
+    # -- t-SNE --
     try:
-        n = min(3000, len(emb_np))
+        from sklearn.manifold import TSNE
+        n_tsne = min(3000, len(emb_np))
         tsne = TSNE(n_components=2, perplexity=30, max_iter=1000, random_state=42)
-        coords = tsne.fit_transform(emb_np[:n])
-        sc = axes[1].scatter(coords[:, 0], coords[:, 1], c=gc_np[:n],
-                             cmap='RdYlBu_r', s=3, alpha=0.6)
-        plt.colorbar(sc, ax=axes[1], label='GC content')
-        axes[1].set_title(f't-SNE — Epoch {epoch} (GC%)')
-    except Exception as e:
-        axes[1].text(0.5, 0.5, f'Failed: {e}', transform=axes[1].transAxes, ha='center')
+        tsne_coords = tsne.fit_transform(emb_np[:n_tsne])
 
-    for ax in axes:
-        ax.set_xlabel('Dim 1')
-        ax.set_ylabel('Dim 2')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"  Saved viz: {save_path}")
+        fig, ax = plt.subplots(figsize=(10, 8))
+        sc = ax.scatter(tsne_coords[:, 0], tsne_coords[:, 1], c=gc_np[:n_tsne],
+                        cmap='RdYlBu_r', s=3, alpha=0.6)
+        plt.colorbar(sc, ax=ax, label='GC content')
+        ax.set_title(f't-SNE — Epoch {epoch}')
+        ax.set_xlabel('t-SNE-1')
+        ax.set_ylabel('t-SNE-2')
+        plt.tight_layout()
+        tsne_path = os.path.join(viz_dir, f"tsne_epoch{epoch:03d}.png")
+        plt.savefig(tsne_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: {tsne_path}")
+
+        if use_wandb:
+            wandb_log["viz/tsne"] = wandb.Image(tsne_path, caption=f"t-SNE Epoch {epoch}")
+
+    except Exception as e:
+        print(f"  t-SNE failed: {e}")
+
+    # -- Singular value spectrum --
+    try:
+        centered = emb_np - emb_np.mean(axis=0)
+        s = np.linalg.svd(centered, compute_uv=False)
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+        # Raw spectrum
+        axes[0].semilogy(s, 'b-', linewidth=1.5)
+        axes[0].set_xlabel('Singular value index')
+        axes[0].set_ylabel('Singular value (log scale)')
+        axes[0].set_title(f'SVD Spectrum — Epoch {epoch}')
+        axes[0].grid(True, alpha=0.3)
+
+        # Cumulative variance
+        var_explained = (s ** 2) / (s ** 2).sum()
+        cum_var = np.cumsum(var_explained)
+        axes[1].plot(cum_var, 'r-', linewidth=1.5)
+        axes[1].axhline(y=0.9, color='gray', linestyle='--', alpha=0.5, label='90%')
+        axes[1].axhline(y=0.99, color='gray', linestyle=':', alpha=0.5, label='99%')
+        axes[1].set_xlabel('Number of components')
+        axes[1].set_ylabel('Cumulative variance explained')
+        axes[1].set_title(f'Cumulative Variance — Epoch {epoch}')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        svd_path = os.path.join(viz_dir, f"svd_epoch{epoch:03d}.png")
+        plt.savefig(svd_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Saved: {svd_path}")
+
+        if use_wandb:
+            wandb_log["viz/svd_spectrum"] = wandb.Image(svd_path, caption=f"SVD Epoch {epoch}")
+
+            # Top singular values as scalar metrics
+            wandb_log["svd/top1_ratio"] = float(var_explained[0])
+            wandb_log["svd/top10_ratio"] = float(cum_var[min(9, len(cum_var)-1)])
+            wandb_log["svd/top50_ratio"] = float(cum_var[min(49, len(cum_var)-1)])
+            wandb_log["svd/effective_rank"] = float(
+                np.exp(-np.sum(var_explained * np.log(var_explained + 1e-10)))
+            )
+
+    except Exception as e:
+        print(f"  SVD viz failed: {e}")
+
+    # -- Embedding norm histogram --
+    try:
+        norms = np.linalg.norm(emb_np, axis=1)
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(norms, bins=50, color='steelblue', alpha=0.8, edgecolor='white')
+        ax.axvline(norms.mean(), color='red', linestyle='--',
+                   label=f'Mean={norms.mean():.1f}')
+        ax.set_xlabel('L2 Norm')
+        ax.set_ylabel('Count')
+        ax.set_title(f'Embedding Norms — Epoch {epoch}')
+        ax.legend()
+        plt.tight_layout()
+        norm_path = os.path.join(viz_dir, f"norms_epoch{epoch:03d}.png")
+        plt.savefig(norm_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        if use_wandb:
+            wandb_log["viz/norm_histogram"] = wandb.Image(norm_path)
+            wandb_log["viz/norm_distribution"] = wandb.Histogram(norms)
+
+    except Exception as e:
+        print(f"  Norm histogram failed: {e}")
+
+    return wandb_log
 
 
 # =============================================================================
@@ -1477,12 +1591,21 @@ def train(args):
                 })
 
                 if use_wandb:
-                    wandb.log(
-                        {f"train/{k}": v for k, v in met.items()}
-                        | {"schedule/lr": lr, "schedule/jepa_mask_ratio": jepa_mr,
-                           "schedule/min_block_len": min_blen},
-                        step=global_step,
-                    )
+                    step_log = {
+                        # Per-step loss curves (high resolution)
+                        "train/total_loss": met['total_loss'],
+                        "train/jepa_loss": met['jepa_loss'],
+                        "train/jepa_cos_sim": met['jepa_cos_sim'],
+                        "train/mlm_loss": met['mlm_loss'],
+                        "train/mlm_acc": met['mlm_acc'],
+                        "train/sigreg": met.get('sigreg_sigreg', 0),
+                        "train/gc_adv_loss": met['gc_adv_loss'],
+                        # Schedule
+                        "schedule/lr": lr,
+                        "schedule/jepa_mask_ratio": jepa_mr,
+                        "schedule/min_block_len": min_blen,
+                    }
+                    wandb.log(step_log, step=global_step)
 
         # -- Epoch eval --
         ep_time = time.time() - epoch_t
@@ -1510,30 +1633,57 @@ def train(args):
         else:
             print(f"  HEALTHY: RankMe={eval_met['rankme']:.1f}")
 
-        # Viz
+        # Viz + wandb logging (combined so viz feeds directly into wandb)
+        viz_wandb_log = {}
         try:
             emb_np = eval_met['embeddings'].float().numpy()
             gc_np = compute_gc_content(eval_met['tokens'], pad_id, gc_ids).numpy()
             n_viz = min(3000, len(emb_np))
             idx = np.random.choice(len(emb_np), n_viz, replace=False)
-            viz_path = str(viz_dir / f"embeddings_epoch{epoch+1:03d}.png")
-            generate_viz(emb_np[idx], gc_np[idx], viz_path, epoch + 1)
+            viz_wandb_log = generate_viz(
+                emb_np[idx], gc_np[idx], str(viz_dir), epoch + 1,
+                use_wandb=use_wandb, global_step=global_step,
+            )
         except Exception as e:
             print(f"  Viz failed: {e}")
 
         if use_wandb:
-            log = {f"epoch/{k}": v for k, v in avg.items()}
-            log.update({
-                "health/rankme": eval_met["rankme"],
-                "health/gc_abs_r": eval_met["gc_abs_r"],
-                "health/std": eval_met["std"],
-                "health/norm": eval_met["norm"],
-                "schedule/ema_tau": ema_tau,
-                "epoch": epoch + 1,
-            })
-            vp = str(viz_dir / f"embeddings_epoch{epoch+1:03d}.png")
-            if os.path.exists(vp):
-                log["viz/embeddings"] = wandb.Image(vp)
+            log = {}
+
+            # -- Loss metrics (grouped by component) --
+            log["loss/total"] = avg['total_loss']
+            log["loss/jepa"] = avg['jepa_loss']
+            log["loss/jepa_cos_sim"] = avg['jepa_cos_sim']
+            log["loss/jepa_l2"] = avg['jepa_l2']
+            log["loss/mlm"] = avg['mlm_loss']
+            log["loss/mlm_acc"] = avg['mlm_acc']
+            log["loss/sigreg"] = avg.get('sigreg_sigreg', 0)
+            log["loss/gc_adv"] = avg['gc_adv_loss']
+
+            # -- Health metrics --
+            log["health/rankme"] = eval_met["rankme"]
+            log["health/gc_abs_r"] = eval_met["gc_abs_r"]
+            log["health/embed_std"] = eval_met["std"]
+            log["health/embed_norm"] = eval_met["norm"]
+            log["health/sigreg_std"] = avg.get('sigreg_std_mean', 0)
+
+            # -- Schedule --
+            log["schedule/lr"] = lr
+            log["schedule/ema_tau"] = ema_tau
+            log["schedule/jepa_mask_ratio"] = jepa_mr
+            log["schedule/min_block_len"] = min_blen
+            log["schedule/gc_lambda"] = gc_lam
+
+            # -- Training stats --
+            log["stats/n_target_tokens"] = avg['n_target_tokens']
+            log["stats/n_mlm_masked"] = avg['n_mlm_masked']
+            log["stats/epoch_time_s"] = ep_time
+
+            log["epoch"] = epoch + 1
+
+            # -- Merge viz plots (UMAP, t-SNE, SVD, histograms, tables) --
+            log.update(viz_wandb_log)
+
             wandb.log(log, step=global_step)
 
         if avg['total_loss'] < best_loss:
