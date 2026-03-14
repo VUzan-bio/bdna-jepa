@@ -30,8 +30,8 @@ B-JEPA learns general-purpose bacterial DNA representations through a dual-objec
 | Version | Params | Architecture | Data | RankMe | Status |
 |---------|--------|-------------|------|--------|--------|
 | v3.1 | 8.5M | 6L × 384D × 6H | 301K frags, char-level | 372/384 | [weights](https://huggingface.co/orgava/dna-bacteria-jepa) |
-| v6.2 | 114.5M | 12L × 576D × 9H | 2M frags, BPE 4096 | 476/576 | checkpoint |
-| **v7.0** | 114.5M | 12L × 576D × 9H | **60M frags**, BPE 4096 | — | **training** |
+| v6.2 | 64.4M | 12L × 576D × 9H | 2M frags, BPE 4096 | 476/576 | checkpoint |
+| **v7.0** | 64.4M | 12L × 576D × 9H | **10M frags** (from 50M pool), BPE 4096 | — | **training** |
 
 ## Architecture
 
@@ -67,7 +67,7 @@ where (v7.0 dynamic schedule):
 
 | | v3.1 | v6.2 | v7.0 | Rationale |
 |---|------|------|------|-----------|
-| Data | 301K frags | 2M frags | **60M frags** | SSL needs data diversity |
+| Data | 301K frags | 2M frags | **10M frags** (50M pool) | SSL needs data diversity |
 | Tokenizer | Char-level | BPE 4096 | BPE 4096 | ~5× compression; learns motifs |
 | Positional | Learned | RoPE | RoPE | Length generalization |
 | JEPA type | CLS-to-CLS | Token-level cross-attn | Token-level cross-attn | Per-position prediction |
@@ -95,16 +95,23 @@ python scripts/fragment_genomes.py \
     --window 2048 --stride 512
 
 python bdna_jepa/models/jepa_v6/pretrain_v6.py \
-    --data-path data/processed/pretrain_full.csv \
+    --data-path data/processed/pretrain_10M.csv \
     --tokenizer-path data/tokenizer/bpe_4096.json \
     --run-version v7.0 \
-    --epochs 10 \
+    --epochs 30 \
     --batch-size 128 \
+    --lr 3e-4 \
+    --warmup-epochs 1 \
     --dynamic-weights \
     --jepa-weight 5.0 \
     --mlm-weight-start 1.0 \
     --mlm-weight-end 5.0 \
-    --val-frac 0.05
+    --predictor-dim 384 \
+    --predictor-depth 6 \
+    --var-gamma 1.0 \
+    --val-frac 0.05 \
+    --no-compile \
+    --save-every 2
 ```
 
 ### Evaluation
@@ -139,9 +146,9 @@ cls_embedding = model.encode(tokens, use_target=True)  # → (1, 576)
 
 ## Training Details
 
-**Data.** 6,326 complete bacterial reference genomes downloaded from NCBI RefSeq via `ncbi-genome-download`. Fragmented into ~60M overlapping windows (2048bp, 512bp stride). BPE tokenization (vocab 4096) compresses each fragment to ~512 tokens.
+**Data.** 6,326 complete bacterial reference genomes downloaded from NCBI RefSeq via `ncbi-genome-download`. Fragmented into ~50M overlapping windows (2048bp, 512bp stride). 10M randomly sampled for v7.0 training (full 50M for scaling experiments). BPE tokenization (vocab 4096) compresses each fragment to ~512 tokens.
 
-**Optimizer.** AdamW (peak LR 3e-4, cosine decay → 1e-6, warmup 1 epoch, weight decay 0.05). bfloat16 mixed precision. Gradient clipping at 1.0.
+**Optimizer.** AdamW (peak LR 3e-4, cosine decay → 1e-6, warmup 1 epoch, weight decay 0.05, batch size 128). bfloat16 mixed precision. Gradient clipping at 1.0. 30 epochs on A100-40GB (~11.4h/epoch).
 
 **Monitoring.** Training health tracked via: RankMe (effective embedding rank from SVD), per-dimension CLS std, embedding norms, JEPA cosine similarity, variance floor activation, GC correlation coefficient. UMAP/t-SNE/SVD visualizations generated every epoch. All metrics logged to Weights & Biases.
 
