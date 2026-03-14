@@ -1498,10 +1498,19 @@ def train(args):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     viz_dir.mkdir(parents=True, exist_ok=True)
 
+    # torch.compile: compile encoder forward for 10-20% speedup (PyTorch 2.0+)
+    if not getattr(args, 'no_compile', False):
+        try:
+            model.context_encoder = torch.compile(model.context_encoder)
+            model.target_encoder = torch.compile(model.target_encoder)
+            print("  torch.compile: encoders compiled")
+        except Exception as e:
+            print(f"  torch.compile: skipped ({e})")
+
     print(f"\n  Training: {args.epochs} epochs, warmup={args.warmup_epochs}")
     print(f"  LR: {args.lr:.1e} -> {args.min_lr:.1e} (cosine)")
     print(f"  JEPA masking: {args.jepa_mask_start:.0%} -> {args.jepa_mask_end:.0%} (curriculum)")
-    print(f"  MLM masking:  {args.mlm_mask_ratio:.0%} (within visible, anti-collapse)")
+    print(f"  MLM masking:  {args.mlm_mask_ratio:.0%} → {args.mlm_mask_end:.0%} (curriculum)")
     print(f"  Block config: {args.num_blocks} blocks, min_len {args.min_block_start}->{args.min_block_end}")
     if getattr(args, 'dynamic_weights', False):
         print(f"  Loss weights (DYNAMIC): JEPA {args.jepa_weight}→{args.jepa_weight*0.2:.1f} | "
@@ -1818,6 +1827,8 @@ def build_parser():
     g.add_argument("--log-every", type=int, default=50)
     g.add_argument("--num-workers", type=int, default=4)
     g.add_argument("--no-wandb", action="store_true")
+    g.add_argument("--no-compile", action="store_true",
+                    help="Disable torch.compile (use if compilation fails)")
     g.add_argument("--wandb-project", default="bdna-jepa")
     g.add_argument("--wandb-run-name", default=None)
 
