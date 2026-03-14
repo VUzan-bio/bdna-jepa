@@ -114,9 +114,13 @@ def extract_embeddings(model, dataloader, device):
 
     for i, batch in enumerate(dataloader):
         tokens = batch["input_ids"].to(device)
-        pad_mask = tokens != model.pad_token_id
+        B, L = tokens.shape
 
-        out = encoder(tokens, pad_mask=pad_mask)
+        # ContextEncoder expects (tokens, position_ids)
+        # For eval (no masking), position_ids = arange(L) for each sample
+        position_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+
+        out = encoder(tokens, position_ids)
 
         if isinstance(out, dict):
             cls = out.get("cls", out.get("cls_token"))
