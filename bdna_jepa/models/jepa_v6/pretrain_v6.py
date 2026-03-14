@@ -1038,19 +1038,34 @@ def compute_losses(
         gc_adv_loss = F.mse_loss(gc_pred, gc_target)
     metrics["gc_adv_loss"] = gc_adv_loss.item()
 
-    # -- Total: JEPA-dominant --
+    # -- v7: Latent Grounding — dynamic JEPA→MLM handoff --
+    # JEPA shapes the representation space early, then MLM drives learning.
+    # Inspired by JEPA-DNA (Larey et al., 2026): CLS prediction as auxiliary
+    # regularizer, token-level MLM as primary objective.
+    progress = getattr(args, '_progress', 0.0)  # Set in training loop
+    if getattr(args, 'dynamic_weights', False):
+        # Cosine schedule: JEPA decays, MLM ramps
+        t = 0.5 * (1 - math.cos(math.pi * progress))  # 0→1
+        jepa_w = args.jepa_weight * (1 - 0.8 * t)      # 5.0→1.0 (or start→20% of start)
+        mlm_w = args.mlm_weight_start + t * (args.mlm_weight_end - args.mlm_weight_start)  # 1.0→5.0
+    else:
+        jepa_w = args.jepa_weight
+        mlm_w = args.mlm_weight
+
     total = (
-        args.jepa_weight * jepa_loss
-        + args.mlm_weight * mlm_loss
+        jepa_w * jepa_loss
+        + mlm_w * mlm_loss
         + args.sigreg_weight * sigreg_loss
         + args.gc_adv_weight * gc_adv_loss
     )
     metrics["total_loss"] = total.item()
 
-    # Loss contribution ratios (diagnostic: is JEPA actually driving learning?)
+    # Loss contribution ratios (diagnostic)
     total_val = total.item() if total.item() > 0 else 1.0
-    metrics["balance/jepa_frac"] = (args.jepa_weight * jepa_loss.item()) / total_val
-    metrics["balance/mlm_frac"] = (args.mlm_weight * mlm_loss.item()) / total_val
+    metrics["balance/jepa_frac"] = (jepa_w * jepa_loss.item()) / total_val
+    metrics["balance/mlm_frac"] = (mlm_w * mlm_loss.item()) / total_val
+    metrics["balance/jepa_w"] = jepa_w
+    metrics["balance/mlm_w"] = mlm_w
 
     return total, metrics
 
@@ -1460,8 +1475,13 @@ def train(args):
     print(f"  JEPA masking: {args.jepa_mask_start:.0%} -> {args.jepa_mask_end:.0%} (curriculum)")
     print(f"  MLM masking:  {args.mlm_mask_ratio:.0%} (within visible, anti-collapse)")
     print(f"  Block config: {args.num_blocks} blocks, min_len {args.min_block_start}->{args.min_block_end}")
-    print(f"  Loss weights: JEPA={args.jepa_weight} MLM={args.mlm_weight} "
-          f"SIGReg={args.sigreg_weight} GC_adv={args.gc_adv_weight}")
+    if getattr(args, 'dynamic_weights', False):
+        print(f"  Loss weights (DYNAMIC): JEPA {args.jepa_weight}→{args.jepa_weight*0.2:.1f} | "
+              f"MLM {args.mlm_weight_start}→{args.mlm_weight_end} | "
+              f"SIGReg={args.sigreg_weight} GC_adv={args.gc_adv_weight}")
+    else:
+        print(f"  Loss weights (STATIC): JEPA={args.jepa_weight} MLM={args.mlm_weight} "
+              f"SIGReg={args.sigreg_weight} GC_adv={args.gc_adv_weight}")
     print(f"  Steps/epoch: {steps_per_epoch}  Total: {total_steps}")
     print(f"{'=' * 70}\n")
 
@@ -1483,11 +1503,12 @@ def train(args):
         progress = epoch / max(args.epochs - 1, 1)
         ema_tau = model.set_ema_decay(progress)
 
-        # Curriculum: mask ratio and block length
+        # Curriculum: mask ratio, block length, and dynamic loss weights
         jepa_mr = curriculum_schedule(epoch, args.epochs, args.jepa_mask_start, args.jepa_mask_end)
         min_blen = int(curriculum_schedule(epoch, args.epochs, args.min_block_start, args.min_block_end))
         min_blen = max(1, min_blen)
         gc_lam = GCAdversary.ganin_lambda(epoch, args.epochs) if args.gc_adv_weight > 0 else 0.0
+        args._progress = progress  # Pass to compute_losses for dynamic weight schedule
 
         epoch_metrics = {}
         opt.zero_grad(set_to_none=True)
@@ -1660,7 +1681,7 @@ def train(args):
                 "metrics": {k: v for k, v in {**avg, **eval_met}.items()
                             if not isinstance(v, torch.Tensor)},
                 "config": vars(args),
-                "version": "v6.2-true-jepa",
+                "version": f"{args.run_version}-latent-grounding",
             }, path)
             print(f"  Saved: {path}")
 
@@ -1723,15 +1744,15 @@ def build_parser():
     g.add_argument("--min-block-end", type=int, default=30,
                     help="Minimum block length at final epoch")
 
-    g = p.add_argument_group("MLM Anti-Collapse")
-    g.add_argument("--mlm-mask-ratio", type=float, default=0.15,
-                    help="Random mask ratio within visible tokens")
+    g = p.add_argument_group("MLM (primary objective in v7)")
+    g.add_argument("--mlm-mask-ratio", type=float, default=0.25,
+                    help="Random mask ratio within visible tokens (v7: 25%%, v6: 15%%)")
 
     g = p.add_argument_group("Loss Weights")
     g.add_argument("--jepa-weight", type=float, default=5.0,
-                    help="JEPA loss weight (PRIMARY)")
+                    help="JEPA loss weight (start weight if --dynamic-weights)")
     g.add_argument("--mlm-weight", type=float, default=0.5,
-                    help="MLM loss weight (anti-collapse guard)")
+                    help="MLM loss weight (static, or ignored if --dynamic-weights)")
     g.add_argument("--sigreg-weight", type=float, default=10.0,
                     help="SIGReg regularization weight")
     g.add_argument("--var-gamma", type=float, default=1.0,
@@ -1739,8 +1760,16 @@ def build_parser():
     g.add_argument("--gc-adv-weight", type=float, default=1.0,
                     help="GC adversary weight")
 
+    g = p.add_argument_group("v7: Latent Grounding (dynamic JEPA→MLM handoff)")
+    g.add_argument("--dynamic-weights", action="store_true",
+                    help="Enable cosine schedule: JEPA decays, MLM ramps (JEPA-DNA style)")
+    g.add_argument("--mlm-weight-start", type=float, default=1.0,
+                    help="MLM weight at epoch 0 (ramps up via cosine)")
+    g.add_argument("--mlm-weight-end", type=float, default=5.0,
+                    help="MLM weight at final epoch")
+
     g = p.add_argument_group("Logging")
-    g.add_argument("--run-version", type=str, default="v6.2",
+    g.add_argument("--run-version", type=str, default="v7.0",
                     help="Version string for checkpoint directory naming")
     g.add_argument("--save-every", type=int, default=5)
     g.add_argument("--log-every", type=int, default=50)
